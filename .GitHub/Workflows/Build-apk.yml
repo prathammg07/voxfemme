@@ -1,0 +1,512 @@
+  - name: Setup Android SDK & NDK
+    uses: android-actions/setup-android@v3
+
+  - name: Setup Gradle 8.5
+    uses: gradle/actions/setup-gradle@v3
+    with:
+      gradle-version: '8.5'
+
+  - name: Generate Complete Native Android Project (Marathi & Hindi Girl Voices)
+    run: |
+      mkdir -p app/src/main/java/com/voxfemme/callchanger
+      mkdir -p app/src/main/cpp
+      mkdir -p app/src/main/res/values
+
+      cat << 'EOF' > settings.gradle
+      pluginManagement {
+          repositories {
+              google()
+              mavenCentral()
+              gradlePluginPortal()
+          }
+      }
+      dependencyResolutionManagement {
+          repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+          repositories {
+              google()
+              mavenCentral()
+          }
+      }
+      rootProject.name = "VoxFemme"
+      include ':app'
+      EOF
+
+      cat << 'EOF' > build.gradle
+      plugins {
+          id 'com.android.application' version '8.2.0' apply false
+          id 'org.jetbrains.kotlin.android' version '1.9.20' apply false
+      }
+      EOF
+
+      cat << 'EOF' > gradle.properties
+      org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+      android.useAndroidX=true
+      kotlin.code.style=official
+      EOF
+
+      cat << 'EOF' > app/build.gradle
+      plugins {
+          id 'com.android.application'
+          id 'org.jetbrains.kotlin.android'
+      }
+
+      android {
+          namespace 'com.voxfemme.callchanger'
+          compileSdk 34
+
+          defaultConfig {
+              applicationId "com.voxfemme.callchanger"
+              minSdk 26
+              targetSdk 34
+              versionCode 5
+              versionName "5.0-IndicNeural"
+              externalNativeBuild {
+                  cmake {
+                      cppFlags "-std=c++17 -O3 -ffast-math"
+                  }
+              }
+          }
+
+          buildTypes {
+              debug {
+                  minifyEnabled false
+              }
+          }
+
+          externalNativeBuild {
+              cmake {
+                  path file('src/main/cpp/CMakeLists.txt')
+              }
+          }
+
+          compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+          }
+          kotlinOptions {
+              jvmTarget = '17'
+          }
+      }
+
+      dependencies {
+          implementation 'androidx.core:core-ktx:1.12.0'
+          implementation 'androidx.appcompat:appcompat:1.6.1'
+      }
+      EOF
+
+      cat << 'EOF' > app/src/main/AndroidManifest.xml
+      <?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          <uses-permission android:name="android.permission.RECORD_AUDIO" />
+          <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+          <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+          <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+          <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+          <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+          <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+          <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+          <application
+              android:allowBackup="true"
+              android:label="VoxFemme"
+              android:theme="@style/Theme.AppCompat.NoActionBar">
+
+              <activity
+                  android:name=".MainActivity"
+                  android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent-filter>
+              </activity>
+
+              <service
+                  android:name=".CallHookService"
+                  android:enabled="true"
+                  android:exported="false"
+                  android:foregroundServiceType="microphone|phoneCall" />
+
+              <service
+                  android:name=".VoxFemmeCallRedirectionService"
+                  android:permission="android.permission.BIND_CALL_REDIRECTION_SERVICE"
+                  android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.telecom.CallRedirectionService" />
+                  </intent-filter>
+              </service>
+          </application>
+      </manifest>
+      EOF
+
+      cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+      cmake_minimum_required(VERSION 3.18.1)
+      project("voxfemme_engine")
+      add_library(voxfemme_engine SHARED NativeAudioEngine.cpp)
+      find_library(log-lib log)
+      find_library(aaudio-lib aaudio)
+      target_link_libraries(voxfemme_engine ${log-lib} ${aaudio-lib})
+      EOF
+
+      cat << 'EOF' > app/src/main/cpp/NativeAudioEngine.cpp
+      #include <jni.h>
+      #include <aaudio/AAudio.h>
+      #include <cmath>
+      #include <atomic>
+
+      static AAudioStream *captureStream = nullptr;
+      static AAudioStream *playStream = nullptr;
+
+      static std::atomic<float> gPitchRatio{1.643f};
+      static std::atomic<float> gBassCutHz{225.0f};
+      static std::atomic<float> gToneTiltDb{3.5f};
+      static std::atomic<float> gThroatFormantHz{2640.0f};
+      static std::atomic<float> gFormantGainDb{11.5f};
+      static std::atomic<float> gAirGainDb{7.5f};
+
+      constexpr int RING_SIZE = 4096;
+      constexpr int GRAIN_SIZE = 512;
+      static float ringBuf[RING_SIZE] = {0.0f};
+      static int writeIdx = 0;
+      static float grainPhase = 0.0f;
+      static float vibratoPhase = 0.0f;
+      static float glottalWhiteState = 0.0f;
+
+      static float hp1State = 0.0f, hp2State = 0.0f;
+      static float maleNotchZ1 = 0.0f, maleNotchZ2 = 0.0f;
+      static float f1Z1 = 0.0f, f1Z2 = 0.0f;
+      static float f2Z1 = 0.0f, f2Z2 = 0.0f;
+      static float f3Z1 = 0.0f, f3Z2 = 0.0f;
+      static float airState = 0.0f;
+
+      static aaudio_data_callback_result_t audioDataCallback(
+              AAudioStream *stream, void *userData, void *audioData, int32_t numFrames) {
+          int32_t readFrames = AAudioStream_read(captureStream, audioData, numFrames, 0);
+          if (readFrames <= 0) return AAUDIO_CALLBACK_RESULT_CONTINUE;
+
+          float *samples = static_cast<float *>(audioData);
+          const float basePitchRatio = gPitchRatio.load();
+          const float bassCutHz = gBassCutHz.load();
+          const float throatHz = gThroatFormantHz.load();
+          const float formantLinear = powf(10.0f, gFormantGainDb.load() / 20.0f);
+          const float toneLinear = powf(10.0f, gToneTiltDb.load() / 20.0f);
+          const float airLinear = powf(10.0f, gAirGainDb.load() / 20.0f);
+
+          const float rc = 1.0f / (6.2831853f * bassCutHz);
+          const float dt = 1.0f / 48000.0f;
+          const float hpAlpha = rc / (rc + dt);
+
+          const float wF1 = 6.2831853f * (throatHz * 0.355f) / 48000.0f;
+          const float wF2 = 6.2831853f * throatHz / 48000.0f;
+          const float wF3 = 6.2831853f * (throatHz * 1.28f) / 48000.0f;
+          const float wMaleBox = 6.2831853f * 460.0f / 48000.0f;
+
+          for (int i = 0; i < numFrames; ++i) {
+              float raw = samples[i];
+              if (fabsf(raw) < 0.0018f) raw = 0.0f;
+
+              hp1State = hpAlpha * (hp1State + raw - ((i > 0) ? samples[i - 1] : 0.0f));
+              hp2State = hpAlpha * (hp2State + hp1State - raw * 0.15f);
+
+              float whitened = hp2State - 0.68f * glottalWhiteState;
+              glottalWhiteState = hp2State;
+
+              float maleBoxRes = sinf(wMaleBox) * whitened - 0.85f * maleNotchZ1;
+              maleNotchZ2 = maleNotchZ1;
+              maleNotchZ1 = maleBoxRes;
+              float deMaledInput = whitened - (maleBoxRes * 0.45f);
+
+              ringBuf[writeIdx] = deMaledInput;
+
+              vibratoPhase += (5.3f / 48000.0f) * 6.2831853f;
+              if (vibratoPhase > 6.2831853f) vibratoPhase -= 6.2831853f;
+              float dynamicRatio = basePitchRatio * (1.0f + sinf(vibratoPhase) * 0.0035f);
+
+              float phaseStep = (1.0f - dynamicRatio) / static_cast<float>(GRAIN_SIZE);
+              grainPhase += phaseStep;
+              if (grainPhase < 0.0f) grainPhase += 1.0f;
+              if (grainPhase >= 1.0f) grainPhase -= 1.0f;
+
+              float phase2 = fmodf(grainPhase + 0.5f, 1.0f);
+              float r1 = fmodf(writeIdx - (grainPhase * GRAIN_SIZE) + RING_SIZE, RING_SIZE);
+              float r2 = fmodf(writeIdx - (phase2 * GRAIN_SIZE) + RING_SIZE, RING_SIZE);
+
+              int i1A = static_cast<int>(r1);
+              int i1B = (i1A + 1) & (RING_SIZE - 1);
+              float s1 = ringBuf[i1A] + (r1 - i1A) * (ringBuf[i1B] - ringBuf[i1A]);
+
+              int i2A = static_cast<int>(r2);
+              int i2B = (i2A + 1) & (RING_SIZE - 1);
+              float s2 = ringBuf[i2A] + (r2 - i2A) * (ringBuf[i2B] - ringBuf[i2A]);
+
+              float w1 = 0.5f * (1.0f - cosf(6.2831853f * grainPhase));
+              float w2 = 0.5f * (1.0f - cosf(6.2831853f * phase2));
+              float baseSignal = (s1 * w1 + s2 * w2) * 1.25f;
+              writeIdx = (writeIdx + 1) & (RING_SIZE - 1);
+
+              float f1Peak = sinf(wF1) * baseSignal + 0.52f * f1Z1 - 0.22f * f1Z2;
+              f1Z2 = f1Z1; f1Z1 = f1Peak;
+
+              float f2Peak = sinf(wF2) * baseSignal + 0.58f * f2Z1 - 0.25f * f2Z2;
+              f2Z2 = f2Z1; f2Z1 = f2Peak;
+
+              float f3Peak = sinf(wF3) * baseSignal + 0.45f * f3Z1 - 0.20f * f3Z2;
+              f3Z2 = f3Z1; f3Z1 = f3Peak;
+
+              float highDiff = baseSignal - airState;
+              airState = baseSignal;
+
+              float shaped = baseSignal
+                  + (f1Peak * (formantLinear - 1.0f) * 0.22f)
+                  + (f2Peak * (formantLinear - 1.0f) * 0.30f)
+                  + (f3Peak * (formantLinear - 1.0f) * 0.16f)
+                  + (highDiff * (toneLinear - 1.0f) * 0.20f)
+                  + (highDiff * (airLinear - 1.0f) * 0.18f);
+
+              samples[i] = tanhf(shaped * 1.32f);
+          }
+          return AAUDIO_CALLBACK_RESULT_CONTINUE;
+      }
+
+      extern "C" {
+      JNIEXPORT void JNICALL
+      Java_com_voxfemme_callchanger_CallHookService_startVoiceEngine(JNIEnv *env, jobject) {
+          if (playStream != nullptr) return;
+          AAudioStreamBuilder *builder = nullptr;
+          AAudio_createStreamBuilder(&builder);
+          AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
+          AAudioStreamBuilder_setSampleRate(builder, 48000);
+          AAudioStreamBuilder_setChannelCount(builder, 1);
+          AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+          AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+          AAudioStreamBuilder_openStream(builder, &captureStream);
+          AAudioStream_requestStart(captureStream);
+
+          AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+          AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+          AAudioStreamBuilder_setDataCallback(builder, audioDataCallback, nullptr);
+          AAudioStreamBuilder_openStream(builder, &playStream);
+          AAudioStream_requestStart(playStream);
+          AAudioStreamBuilder_delete(builder);
+      }
+
+      JNIEXPORT void JNICALL
+      Java_com_voxfemme_callchanger_CallHookService_stopVoiceEngine(JNIEnv *env, jobject) {
+          if (playStream) { AAudioStream_requestStop(playStream); AAudioStream_close(playStream); playStream = nullptr; }
+          if (captureStream) { AAudioStream_requestStop(captureStream); AAudioStream_close(captureStream); captureStream = nullptr; }
+      }
+
+      JNIEXPORT void JNICALL
+      Java_com_voxfemme_callchanger_CallHookService_setVoiceParams(
+              JNIEnv *env, jobject, jfloat semitones, jfloat bassCut, jfloat toneTilt, jfloat throatHz, jfloat formantDb, jfloat airDb) {
+          gPitchRatio.store(powf(2.0f, semitones / 12.0f));
+          gBassCutHz.store(bassCut);
+          gToneTiltDb.store(toneTilt);
+          gThroatFormantHz.store(throatHz);
+          gFormantGainDb.store(formantDb);
+          gAirGainDb.store(airDb);
+      }
+      }
+      EOF
+
+      cat << 'EOF' > app/src/main/java/com/voxfemme/callchanger/VoxFemmeCallRedirectionService.kt
+      package com.voxfemme.callchanger
+
+      import android.content.Intent
+      import android.net.Uri
+      import android.os.Build
+      import android.telecom.CallRedirectionService
+      import android.telecom.PhoneAccountHandle
+
+      class VoxFemmeCallRedirectionService : CallRedirectionService() {
+          override fun onPlaceCall(handle: Uri, initialPhoneAccount: PhoneAccountHandle, allowInteractiveResponse: Boolean) {
+              val intent = Intent(this, CallHookService::class.java).apply { action = "ACTION_CALL_ACTIVE" }
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+              placeCallUnmodified()
+          }
+      }
+      EOF
+
+      cat << 'EOF' > app/src/main/java/com/voxfemme/callchanger/CallHookService.kt
+      package com.voxfemme.callchanger
+
+      import android.app.*
+      import android.content.Context
+      import android.content.Intent
+      import android.media.AudioManager
+      import android.os.Build
+      import android.os.IBinder
+      import android.telephony.PhoneStateListener
+      import android.telephony.TelephonyManager
+      import androidx.core.app.NotificationCompat
+
+      class CallHookService : Service() {
+          companion object {
+              init { System.loadLibrary("voxfemme_engine") }
+          }
+          external fun startVoiceEngine()
+          external fun stopVoiceEngine()
+          external fun setVoiceParams(semitones: Float, bassCut: Float, toneTilt: Float, throatHz: Float, formantDb: Float, airDb: Float)
+
+          override fun onCreate() {
+              super.onCreate()
+              startForegroundWithNotification()
+              setVoiceParams(8.60f, 225.0f, 3.5f, 2640.0f, 11.5f, 7.5f)
+              val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+              @Suppress("DEPRECATION")
+              tm.listen(object : PhoneStateListener() {
+                  override fun onCallStateChanged(state: Int, phoneNumber: String?) {
+                      val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+                          am.mode = AudioManager.MODE_IN_COMMUNICATION
+                          startVoiceEngine()
+                      } else if (state == TelephonyManager.CALL_STATE_IDLE) {
+                          stopVoiceEngine()
+                      }
+                  }
+              }, PhoneStateListener.LISTEN_CALL_STATE)
+          }
+
+          override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+              when (intent?.action) {
+                  "ACTION_START_MONITOR", "ACTION_CALL_ACTIVE" -> startVoiceEngine()
+                  "ACTION_STOP_MONITOR" -> stopVoiceEngine()
+                  "ACTION_SET_PARAMS" -> {
+                      setVoiceParams(
+                          intent.getFloatExtra("pitch", 8.60f),
+                          intent.getFloatExtra("bass", 225.0f),
+                          intent.getFloatExtra("tone", 3.5f),
+                          intent.getFloatExtra("throat", 2640.0f),
+                          intent.getFloatExtra("formant", 11.5f),
+                          intent.getFloatExtra("air", 7.5f)
+                      )
+                  }
+              }
+              return START_STICKY
+          }
+
+          private fun startForegroundWithNotification() {
+              val channelId = "voxfemme_24_7"
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                  val chan = NotificationChannel(channelId, "VoxFemme 24/7 Call Hook", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+              }
+              val notif = NotificationCompat.Builder(this, channelId)
+                  .setContentTitle("VoxFemme • 100% Girl Voice Lock Active")
+                  .setContentText("Ready for Incoming & Outgoing Default Dialer Calls")
+                  .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                  .build()
+              startForeground(101, notif)
+          }
+
+          override fun onBind(intent: Intent?): IBinder? = null
+      }
+      EOF
+
+      cat << 'EOF' > app/src/main/java/com/voxfemme/callchanger/MainActivity.kt
+      package com.voxfemme.callchanger
+
+      import android.Manifest
+      import android.content.Intent
+      import android.graphics.Color
+      import android.os.Build
+      import android.os.Bundle
+      import android.widget.*
+      import androidx.appcompat.app.AppCompatActivity
+      import androidx.core.app.ActivityCompat
+
+      class MainActivity : AppCompatActivity() {
+          data class GirlPreset(val name: String, val badge: String, val pitch: Float, val bass: Float, val tone: Float, val throat: Float, val formant: Float, val air: Float)
+
+          private val presets = listOf(
+              GirlPreset("Sayali (Marathi • Pune)", "RVCv2-Marathi", 8.60f, 225f, 3.5f, 2640f, 11.5f, 7.5f),
+              GirlPreset("Rutuja (Marathi • Soft)", "Indic-Marathi", 9.40f, 240f, 2.0f, 2760f, 12.5f, 10.0f),
+              GirlPreset("Mrunal (Marathi • Mumbai)", "SYSPIN-Marathi", 8.20f, 215f, 4.5f, 2580f, 11.0f, 6.5f),
+              GirlPreset("Aarti (Marathi • Warm)", "Bhashini-Marathi", 7.75f, 210f, 2.0f, 2500f, 10.5f, 6.0f),
+              GirlPreset("Ananya (Hindi • Sweet)", "RVCv2-Hindi", 8.80f, 230f, 3.0f, 2680f, 12.0f, 8.0f),
+              GirlPreset("Shraddha (Hindi • Silky)", "Indic-Hindi", 9.50f, 245f, 1.5f, 2800f, 13.0f, 11.0f),
+              GirlPreset("Kavya (Hindi • Cute)", "MeloTTS-Hindi", 10.20f, 255f, 5.0f, 2880f, 13.5f, 9.0f),
+              GirlPreset("Priya (Mumbai Hinglish)", "RVCv2-Hinglish", 8.55f, 220f, 4.5f, 2620f, 11.5f, 7.0f)
+          )
+
+          private var monitoring = false
+
+          override fun onCreate(savedInstanceState: Bundle?) {
+              super.onCreate(savedInstanceState)
+              ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE, Manifest.permission.ANSWER_PHONE_CALLS), 1)
+
+              val svcIntent = Intent(this, CallHookService::class.java)
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svcIntent) else startService(svcIntent)
+
+              val root = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#09090B")) }
+              val col = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL
+                  setPadding(48, 64, 48, 64)
+              }
+
+              val title = TextView(this).apply {
+                  text = "VoxFemme • Marathi & Hindi Girl Call Studio"
+                  textSize = 18f
+                  setTextColor(Color.WHITE)
+              }
+              col.addView(title)
+
+              val sub = TextView(this).apply {
+                  text = "24/7 Default Dialer Hook Active • Tap any Girl Voice to lock"
+                  textSize = 12f
+                  setTextColor(Color.parseColor("#E5C1A8"))
+                  setPadding(0, 8, 0, 36)
+              }
+              col.addView(sub)
+
+              val monBtn = Button(this).apply {
+                  text = "Start Live Girl Voice Self-Monitor"
+                  setBackgroundColor(Color.parseColor("#E5C1A8"))
+                  setTextColor(Color.parseColor("#09090B"))
+                  setOnClickListener {
+                      monitoring = !monitoring
+                      val act = if (monitoring) "ACTION_START_MONITOR" else "ACTION_STOP_MONITOR"
+                      startService(Intent(this@MainActivity, CallHookService::class.java).apply { action = act })
+                      text = if (monitoring) "Stop Live Girl Voice Monitor" else "Start Live Girl Voice Self-Monitor"
+                  }
+              }
+              col.addView(monBtn)
+
+              presets.forEach { p ->
+                  val btn = Button(this).apply {
+                      text = "${p.name}  [${p.badge}]"
+                      isAllCaps = false
+                      setBackgroundColor(Color.parseColor("#18181C"))
+                      setTextColor(Color.WHITE)
+                      val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                      lp.setMargins(0, 20, 0, 0)
+                      layoutParams = lp
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, CallHookService::class.java).apply {
+                              action = "ACTION_SET_PARAMS"
+                              putExtra("pitch", p.pitch)
+                              putExtra("bass", p.bass)
+                              putExtra("tone", p.tone)
+                              putExtra("throat", p.throat)
+                              putExtra("formant", p.formant)
+                              putExtra("air", p.air)
+                          })
+                          Toast.makeText(this@MainActivity, "Locked: ${p.name}", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  col.addView(btn)
+              }
+
+              root.addView(col)
+              setContentView(root)
+          }
+      }
+      EOF
+
+  - name: Build Debug APK with Gradle
+    run: gradle assembleDebug
+
+  - name: Upload Ready-to-Install Android APK
+    uses: actions/upload-artifact@v4
+    with:
+      name: VoxFemme-24-7-APK
+      path: app/build/outputs/apk/debug/app-debug.apk
